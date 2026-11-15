@@ -41,3 +41,7 @@ Use `-A x64` for a 64-bit build. Both builds link the C runtime statically, so n
 - Add TPDF dither when the device format has fewer bits than the source (rare: only when a device accepts 16-bit and nothing else).
 - Add an option for 24-bit and higher output in shared mode when the device can't use exclusive mode.
 - Add a unicode description (OUT_VER_U) for newer WACUP builds.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
