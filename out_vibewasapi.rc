@@ -1,0 +1,21 @@
+#include <windows.h>
+#include "resource.h"
+
+IDD_CONFIG DIALOGEX 0, 0, 260, 158
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vibe Wasapi Settings"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Output device:", -1, 7, 9, 80, 8
+    COMBOBOX        IDC_DEVICE, 7, 20, 246, 140, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "Exclusive mode (bit-perfect when volume is 100% and pan is centred)", IDC_EXCLUSIVE, 7, 40, 246, 10
+    AUTOCHECKBOX    "Fall back to shared mode if exclusive mode fails", IDC_FALLBACK, 17, 53, 236, 10
+    AUTOCHECKBOX    "Apply Winamp volume / pan in software", IDC_VOLUME, 7, 66, 246, 10
+    LTEXT           "Buffer length (ms):", -1, 7, 84, 110, 8
+    EDITTEXT        IDC_RINGMS, 120, 82, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Device period (ms, 0 = default):", -1, 7, 100, 110, 8
+    EDITTEXT        IDC_PERIODMS, 120, 98, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "", IDC_STATUS, 7, 116, 246, 18
+    DEFPUSHBUTTON   "OK", IDOK, 149, 137, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 203, 137, 50, 14
+END
