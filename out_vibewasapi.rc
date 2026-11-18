@@ -19,3 +19,33 @@ BEGIN
     DEFPUSHBUTTON   "OK", IDOK, 149, 137, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 203, 137, 50, 14
 END
+
+// Keep the version numbers in step with PLUGIN_VERSION in out_vibewasapi.cpp.
+1 VERSIONINFO
+FILEVERSION     0,3,0,0
+PRODUCTVERSION  0,3,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS__WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Juanus Smith"
+            VALUE "FileDescription",  "Output Plug-in"
+            VALUE "FileVersion",      "0.3.0.0"
+            VALUE "InternalName",     "out_vibewasapi"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 Juanus Smith"
+            VALUE "OriginalFilename", "out_vibewasapi.dll"
+            VALUE "ProductName",      "Vibe Wasapi"
+            VALUE "ProductVersion",   "0.3.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

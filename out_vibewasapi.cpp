@@ -27,7 +27,7 @@
 #include "out.h"
 #include "resource.h"
 
-#define PLUGIN_VERSION "0.2"
+#define PLUGIN_VERSION "0.3"
 #define INI_SECTION L"out_vibewasapi"
 
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
@@ -574,7 +574,7 @@ static void Flush(int);
 static int GetOutputTime();
 static int GetWrittenTime();
 
-static char g_desc[] = "Vibe Wasapi v" PLUGIN_VERSION " (out_vibewasapi.dll)";
+static char g_desc[] = "Vibe Wasapi v" PLUGIN_VERSION;
 
 static Out_Module g_mod = {
     OUT_VER, g_desc, 0x56574153 /* VWAS */, NULL, NULL,
