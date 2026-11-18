@@ -1,5 +1,6 @@
 #include <windows.h>
 #include "resource.h"
+#include "version.h"
 
 IDD_CONFIG DIALOGEX 0, 0, 260, 158
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
@@ -20,10 +21,10 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 203, 137, 50, 14
 END
 
-// Keep the version numbers in step with PLUGIN_VERSION in out_vibewasapi.cpp.
+// The version numbers come from version.h, so they only need changing there.
 1 VERSIONINFO
-FILEVERSION     0,4,0,0
-PRODUCTVERSION  0,4,0,0
+FILEVERSION     VIBE_VERSION_MAJOR,VIBE_VERSION_MINOR,0,0
+PRODUCTVERSION  VIBE_VERSION_MAJOR,VIBE_VERSION_MINOR,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS__WINDOWS32
@@ -36,12 +37,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Juanus Smith"
             VALUE "FileDescription",  "Output Plug-in"
-            VALUE "FileVersion",      "0.4.0.0"
+            VALUE "FileVersion",      VIBE_VERSION_FILE_TEXT
             VALUE "InternalName",     "out_vibewasapi"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Juanus Smith"
             VALUE "OriginalFilename", "out_vibewasapi.dll"
             VALUE "ProductName",      "Vibe Wasapi"
-            VALUE "ProductVersion",   "0.4.0.0"
+            VALUE "ProductVersion",   VIBE_VERSION_FILE_TEXT
         END
     END
     BLOCK "VarFileInfo"

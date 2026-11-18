@@ -1,0 +1,40 @@
+# Builds the plug-in and runs the automated tests whenever code reaches GitHub.
+# The finished DLLs can be downloaded from the "Artifacts" section of each run.
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cmake_arch: Win32
+            artifact: out_vibewasapi-x86
+          - cmake_arch: x64
+            artifact: out_vibewasapi-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -A ${{ matrix.cmake_arch }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/Release/out_vibewasapi.dll
+          if-no-files-found: error
