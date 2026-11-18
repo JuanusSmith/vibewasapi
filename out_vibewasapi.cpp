@@ -27,7 +27,7 @@
 #include "out.h"
 #include "resource.h"
 
-#define PLUGIN_VERSION "0.3"
+#define PLUGIN_VERSION "0.4"
 #define INI_SECTION L"out_vibewasapi"
 
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
@@ -425,16 +425,18 @@ static void PublishPosition() {
     long long played = 0;
     if (r_clock && r_clockFreq) {
         UINT64 pos = 0;
-        if (SUCCEEDED(r_clock->GetPosition(&pos, NULL))) {
-            long long dev = (long long)((double)pos * g_srate / (double)r_clockFreq);
-            played = dev - r_committedSilence;
-            if (played < 0) played = 0;
-            if (played > r_submittedReal) played = r_submittedReal;
-        }
+        // A dead device can't report a position; keep the last good song time.
+        if (FAILED(r_clock->GetPosition(&pos, NULL))) return;
+        long long dev = (long long)((double)pos * g_srate / (double)r_clockFreq);
+        played = dev - r_committedSilence;
+        if (played < 0) played = 0;
+        if (played > r_submittedReal) played = r_submittedReal;
     }
     g_played = r_frameOffset + played;
     g_submitted = r_frameOffset + r_submittedReal;
 }
+
+static void HandleDeviceError();
 
 static void ProcessCommand() {
     LONG cmd = InterlockedExchange(&g_cmd, CMD_NONE);
@@ -446,7 +448,17 @@ static void ProcessCommand() {
         break;
     case CMD_UNPAUSE:
         r_paused = false;
-        if (r_client) r_client->Start();
+        // No audio events arrive while paused, so a device lost during the pause
+        // first shows up here. Reopen it from the render loop, after the ack, so
+        // Winamp isn't blocked while the endpoint comes back.
+        if (r_client) {
+            HRESULT hr = r_client->Start();
+            if (FAILED(hr) && hr != AUDCLNT_E_NOT_STOPPED) HandleDeviceError();
+        }
+        if (!r_client) {
+            r_retries = 0;
+            r_lastRetry = GetTickCount() - 1001;  // retry on this loop pass
+        }
         break;
     case CMD_FLUSH:
         r_frameOffset = 0;
@@ -542,7 +554,8 @@ static DWORD WINAPI RenderThread(LPVOID) {
                     if (FAILED(hr)) { HandleDeviceError(); continue; }
                 }
                 PublishPosition();
-            } else if (!g_failed && GetTickCount() - r_lastRetry > 1000) {
+            } else if (!r_paused && !g_failed && GetTickCount() - r_lastRetry > 1000) {
+                // Paused streams wait for unpause, so a long disconnect can't use up the retries.
                 TryReopen();
             }
         }

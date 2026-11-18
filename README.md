@@ -9,6 +9,7 @@
 - Uses MMCSS "Pro Audio" thread priority.
 - Seek and pause positions are accurate because it reads the WASAPI clock (IAudioClock).
 - If the device is unplugged or the endpoint changes, it reopens the device automatically, retrying up to 5 times.
+- If the device disconnects while paused, such as Bluetooth headphones turning off, it reopens the device when you unpause and resumes from the same position.
 
 ## Install
 1. Copy `out_vibewasapi.dll` into the `Plugins` folder of Winamp or WACUP:
