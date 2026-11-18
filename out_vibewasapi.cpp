@@ -27,7 +27,7 @@
 #include "out.h"
 #include "resource.h"
 
-#define PLUGIN_VERSION "0.1"
+#define PLUGIN_VERSION "0.2"
 #define INI_SECTION L"out_vibewasapi"
 
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
@@ -35,6 +35,12 @@
 #endif
 #ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
 #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
+#ifndef AUDCLNT_E_RESOURCES_INVALIDATED
+#define AUDCLNT_E_RESOURCES_INVALIDATED AUDCLNT_ERR(0x026)
+#endif
+#ifndef E_NOTFOUND
+#define E_NOTFOUND HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
 #endif
 #ifndef AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
 #define AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED AUDCLNT_ERR(0x019)
@@ -467,6 +473,12 @@ static void HandleDeviceError() {
     _snwprintf(g_modeDesc, 159, L"Device lost - retrying...");
 }
 
+static bool IsTransientOpenError(HRESULT hr) {
+    return hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_DEVICE_IN_USE ||
+           hr == AUDCLNT_E_SERVICE_NOT_RUNNING || hr == AUDCLNT_E_ENDPOINT_CREATE_FAILED ||
+           hr == AUDCLNT_E_RESOURCES_INVALIDATED || hr == E_NOTFOUND;
+}
+
 static void TryReopen() {
     r_lastRetry = GetTickCount();
     if (SUCCEEDED(InitDevice()) && SUCCEEDED(FillAvailable()) && (r_paused || SUCCEEDED(r_client->Start()))) {
@@ -502,9 +514,18 @@ static DWORD WINAPI RenderThread(LPVOID) {
     r_retries = 0;
     ResetCounters();
 
-    HRESULT hr = InitDevice();
-    if (SUCCEEDED(hr)) hr = FillAvailable();
-    if (SUCCEEDED(hr)) hr = r_client->Start();
+    // The endpoint can be briefly invalid or busy right after the previous
+    // stream (or another app) releases it - e.g. when enqueue+play stops and
+    // restarts playback back-to-back. Retry with a fresh device for ~3 s.
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 15 && !g_quit; ++attempt) {
+        hr = InitDevice();
+        if (SUCCEEDED(hr)) hr = FillAvailable();
+        if (SUCCEEDED(hr)) hr = r_client->Start();
+        if (SUCCEEDED(hr) || !IsTransientOpenError(hr)) break;
+        ReleaseDevice();
+        Sleep(200);
+    }
     g_initHr = hr;
     SetEvent(g_readyEvent);
 
