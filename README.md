@@ -36,7 +36,7 @@ Use `-A x64` for a 64-bit build. Both builds link the C runtime statically, so n
 - One MTA render thread makes every IAudioClient call. It wakes on the WASAPI event, converts audio from the ring buffer into the device format, and fills any gap with silence.
 - The plug-in records how much silence went out before real audio. That lets it turn the device clock position into song time exactly, so `GetOutputTime` and `IsPlaying` (used for end-of-track drain) stay correct even after underruns.
 
-## Ideas for v0.2
+## Ideas for future versions
 - Reopen the device immediately when settings change, instead of waiting for the next track.
 - Add TPDF dither when the device format has fewer bits than the source (rare: only when a device accepts 16-bit and nothing else).
 - Add an option for 24-bit and higher output in shared mode when the device can't use exclusive mode.
