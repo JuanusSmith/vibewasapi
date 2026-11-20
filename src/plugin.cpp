@@ -13,6 +13,16 @@
 //     Audio calls share it; Open and Close hold it exclusively only for a moment, and
 //     never while waiting for a device, so the interface stays responsive.
 //   * Everything else uses atomic values, which are safe to read from any thread.
+//
+// Gapless playback works like this:
+//   1. Near the end of a track, IsPlaying reports "finished" while about
+//      kGaplessLeadMs of audio is still queued, so Winamp starts the next track early.
+//   2. Close then leaves the stream running ("lingering") to play that last audio.
+//   3. If the next Open has the same format and settings, it continues the same
+//      stream, and the new track's audio follows the old one with no gap.
+//   4. Otherwise Open waits for the old audio to finish, then starts afresh.
+// A Close that arrives mid-track (the user pressed Stop or chose another track)
+// fades out and stops immediately instead.
 #include <windows.h>
 #include <atomic>
 #include <string>
@@ -26,16 +36,32 @@
 
 namespace {
 
+// How much audio may still be queued when IsPlaying reports the end of a track. This
+// is the time Winamp has to open the next track before a gap could be heard.
+const int kGaplessLeadMs = 500;
+
+// Extra time Open allows, beyond the queued audio, for a lingering track to finish.
+const DWORD kTailWaitSlackMs = 500;
+
 CRITICAL_SECTION g_lifecycleLock;
 SRWLOCK g_streamLock = SRWLOCK_INIT;
 
 RenderEngine g_engine;
 SpscRing g_ring;                         // Guarded by g_streamLock when replaced
 StreamFormat g_format;                   // Guarded by g_streamLock
+Settings g_streamSettings;               // Settings of the running stream; guarded by g_lifecycleLock
 std::atomic<bool> g_streamOpen{false};
 std::atomic<int> g_sampleRate{44100};    // Atomic copy for the position functions
-std::atomic<long long> g_writtenFrames{0};
 std::atomic<int> g_seekBaseMs{0};        // Song time of the most recent seek
+
+// Frame counters. "Stream" counts run across gapless track changes, "track" counts
+// restart with each track, and both restart at a seek.
+std::atomic<long long> g_streamFramesWritten{0};
+std::atomic<long long> g_trackStartFrame{0};   // Stream frame where the current track begins
+std::atomic<long long> g_trackFramesWritten{0};
+
+// Set when IsPlaying reported the end of the track; cleared when more audio arrives.
+std::atomic<bool> g_endReported{false};
 
 std::wstring g_iniPath;                  // Set once in Init, then only read
 
@@ -94,12 +120,36 @@ std::wstring FindIniPath() {
     return path;
 }
 
-// Stops the current stream. The caller must hold g_lifecycleLock.
-void CloseStreamLocked() {
+// Frames still to be heard: audio waiting in the ring plus audio inside the device.
+// The caller must hold g_streamLock (shared) or g_lifecycleLock.
+long long QueuedFrames() {
+    const long long inRing = (long long)(g_ring.pendingBytes() / (size_t)g_format.frameBytes());
+    const long long inDevice = g_engine.submittedFrames() - g_engine.playedFrames();
+    return inRing + (inDevice > 0 ? inDevice : 0);
+}
+
+// Stops Winamp's access to the stream. The caller must hold g_lifecycleLock.
+void DetachStreamLocked() {
     AcquireSRWLockExclusive(&g_streamLock);
     g_streamOpen.store(false);
     ReleaseSRWLockExclusive(&g_streamLock);
-    g_engine.stop();
+}
+
+// Stops the current stream, with a short fade if it is audible.
+// The caller must hold g_lifecycleLock.
+void CloseStreamLocked(bool fadeOut) {
+    DetachStreamLocked();
+    g_engine.stop(fadeOut);
+}
+
+// Waits for a lingering track's last audio to finish playing.
+// The caller must hold g_lifecycleLock.
+void WaitForLingeringTail() {
+    const DWORD limit = (DWORD)kGaplessLeadMs + (DWORD)g_engine.latencyMs() + kTailWaitSlackMs;
+    const DWORD startTick = GetTickCount();
+    while (g_engine.lingerActive() && QueuedFrames() > 0 && GetTickCount() - startTick < limit) {
+        Sleep(5);
+    }
 }
 
 void Config(HWND parent) {
@@ -121,18 +171,18 @@ void Init() {
 }
 
 void Quit() {
-    Close();
+    // Winamp is closing, so stop at once, even if a track is lingering.
+    EnterCriticalSection(&g_lifecycleLock);
+    CloseStreamLocked(false);
+    LeaveCriticalSection(&g_lifecycleLock);
     g_engine.shutdown();
     DeleteCriticalSection(&g_lifecycleLock);
 }
 
-// Starts a new stream. Returns the output latency in ms, or -1 on failure.
+// Starts a new track. Returns the output latency in ms, or -1 on failure.
 int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
     if (sampleRate <= 0 || channels < 1 || channels > 8) return -1;
     if (bitsPerSample != 8 && bitsPerSample != 16 && bitsPerSample != 24 && bitsPerSample != 32) return -1;
-
-    EnterCriticalSection(&g_lifecycleLock);
-    CloseStreamLocked();
 
     StreamParams params;
     params.settings = LoadSettings(g_iniPath);
@@ -140,6 +190,26 @@ int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
     params.format.channels = channels;
     params.format.bitsPerSample = bitsPerSample;
     params.ring = &g_ring;
+
+    EnterCriticalSection(&g_lifecycleLock);
+
+    // Gapless: continue the previous track's stream if nothing about it would change.
+    if (g_engine.isLingering()) {
+        const bool compatible = params.format == g_format && params.settings == g_streamSettings;
+        if (compatible && g_engine.resumeFromLinger()) {
+            g_trackStartFrame.store(g_streamFramesWritten.load());
+            g_trackFramesWritten.store(0);
+            g_seekBaseMs.store(0);
+            g_endReported.store(false);
+            g_streamOpen.store(true);
+            LeaveCriticalSection(&g_lifecycleLock);
+            return g_engine.latencyMs();
+        }
+
+        // A different format needs a new stream, but let the last track finish first.
+        WaitForLingeringTail();
+    }
+    CloseStreamLocked(false);
 
     // Size the ring as a whole number of frames so a frame never splits across a write.
     long long ringFrames = (long long)params.settings.ringMs * sampleRate / 1000;
@@ -150,9 +220,13 @@ int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
     g_ring.allocate((size_t)ringFrames * params.format.frameBytes());
     ReleaseSRWLockExclusive(&g_streamLock);
 
+    g_streamSettings = params.settings;
     g_sampleRate.store(sampleRate);
-    g_writtenFrames.store(0);
+    g_streamFramesWritten.store(0);
+    g_trackStartFrame.store(0);
+    g_trackFramesWritten.store(0);
     g_seekBaseMs.store(0);
+    g_endReported.store(false);
 
     // This can take a few seconds if the device is busy. Only the lifecycle lock is
     // held, so Pause, volume changes and position updates are not blocked.
@@ -163,9 +237,13 @@ int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
     return SUCCEEDED(hr) ? g_engine.latencyMs() : -1;
 }
 
+// Ends a track. See the gapless notes at the top of this file.
 void Close() {
     EnterCriticalSection(&g_lifecycleLock);
-    CloseStreamLocked();
+    if (g_streamOpen.load()) {
+        if (g_endReported.load() && g_engine.beginLinger()) DetachStreamLocked();
+        else CloseStreamLocked(true);
+    }
     LeaveCriticalSection(&g_lifecycleLock);
 }
 
@@ -178,8 +256,12 @@ int Write(char* buffer, int length) {
     if (g_streamOpen.load()) {
         const size_t frameBytes = (size_t)g_format.frameBytes();
         const size_t wholeFrames = (size_t)length - (size_t)length % frameBytes;
-        const size_t written = g_ring.write((const unsigned char*)buffer, wholeFrames);
-        g_writtenFrames.fetch_add((long long)(written / frameBytes));
+        const long long written = (long long)(g_ring.write((const unsigned char*)buffer, wholeFrames) / frameBytes);
+        if (written > 0) {
+            g_streamFramesWritten.fetch_add(written);
+            g_trackFramesWritten.fetch_add(written);
+            g_endReported.store(false);  // More audio means this is not the end yet
+        }
         result = 0;
     }
     ReleaseSRWLockShared(&g_streamLock);
@@ -199,12 +281,16 @@ int CanWrite() {
     return result;
 }
 
-// Returns nonzero while audio is still waiting to be heard.
+// Returns nonzero while the track is still playing. Winamp calls this after the last
+// Write to learn when the track has ended. Reporting the end slightly early is what
+// makes gapless playback possible; the remaining audio still plays in full.
 int IsPlaying() {
     int result = 0;
     AcquireSRWLockShared(&g_streamLock);
     if (g_streamOpen.load()) {
-        result = g_ring.pendingBytes() > 0 || g_engine.playedFrames() < g_engine.submittedFrames();
+        const long long leadFrames = (long long)g_format.sampleRate * kGaplessLeadMs / 1000;
+        result = QueuedFrames() > leadFrames;
+        if (!result) g_endReported.store(true);
     }
     ReleaseSRWLockShared(&g_streamLock);
     return result;
@@ -229,8 +315,11 @@ void Flush(int timeMs) {
     EnterCriticalSection(&g_lifecycleLock);
     if (g_streamOpen.load()) {
         g_ring.requestDiscard();
-        g_writtenFrames.store(0);
+        g_streamFramesWritten.store(0);
+        g_trackStartFrame.store(0);
+        g_trackFramesWritten.store(0);
         g_seekBaseMs.store(timeMs);
+        g_endReported.store(false);
         g_engine.flush();
     }
     LeaveCriticalSection(&g_lifecycleLock);
@@ -239,13 +328,18 @@ void Flush(int timeMs) {
 // The song time, in ms, that the listener is hearing now.
 int GetOutputTime() {
     if (!g_streamOpen.load()) return 0;
-    return g_seekBaseMs.load() + (int)(g_engine.playedFrames() * 1000 / g_sampleRate.load());
+
+    // Right after a gapless change the previous track may still be audible, so the
+    // new track's time stays at its starting point until its own audio is heard.
+    long long trackFrames = g_engine.playedFrames() - g_trackStartFrame.load();
+    if (trackFrames < 0) trackFrames = 0;
+    return g_seekBaseMs.load() + (int)(trackFrames * 1000 / g_sampleRate.load());
 }
 
 // The song time, in ms, of the newest audio Winamp has written.
 int GetWrittenTime() {
     if (!g_streamOpen.load()) return 0;
-    return g_seekBaseMs.load() + (int)(g_writtenFrames.load() * 1000 / g_sampleRate.load());
+    return g_seekBaseMs.load() + (int)(g_trackFramesWritten.load() * 1000 / g_sampleRate.load());
 }
 
 }  // namespace

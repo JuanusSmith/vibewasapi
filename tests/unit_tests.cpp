@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "fader.h"
 #include "position_tracker.h"
 #include "sample_convert.h"
 #include "settings.h"
@@ -83,7 +84,31 @@ static void TestRingDiscardDropsOnlyOldAudio() {
     ring.write(newAudio, 2);
     CHECK(ring.pendingBytes() == 2);
 
+    ring.applyDiscard();
     unsigned char out[8] = {0};
+    CHECK(ring.read(out, 8) == 2);
+    CHECK(out[0] == 8 && out[1] == 9);
+}
+
+static void TestRingReadStopsAtDiscardMarker() {
+    SpscRing ring;
+    ring.allocate(8);
+    const unsigned char oldAudio[3] = {1, 2, 3};
+    const unsigned char newAudio[2] = {8, 9};
+    ring.write(oldAudio, 3);
+    ring.requestDiscard();
+    ring.write(newAudio, 2);
+
+    // Before the discard is applied, only the stale audio can be read (for a fade-out).
+    unsigned char out[8] = {0};
+    CHECK(ring.read(out, 2) == 2);
+    CHECK(out[0] == 1 && out[1] == 2);
+    CHECK(ring.read(out, 8) == 1);
+    CHECK(out[0] == 3);
+    CHECK(ring.read(out, 8) == 0);
+
+    // Applying the discard after reading up to the marker loses no new audio.
+    ring.applyDiscard();
     CHECK(ring.read(out, 8) == 2);
     CHECK(out[0] == 8 && out[1] == 9);
 }
@@ -197,6 +222,64 @@ static void TestGains() {
     CHECK(Near(gains[1], 0.5));
 }
 
+static void TestConvertAppliesFadeRamp() {
+    const int16_t in[4] = {16384, 16384, 16384, 16384};
+    int16_t out[4] = {0};
+    GainRamp ramp = {1.0f, -0.5f, 2, 0.0f};  // 1.0, 0.5, then silence
+    ConvertFrames((const unsigned char*)in, (unsigned char*)out, 4, 16, 1, OutFormat{16, 16, false}, NULL, &ramp);
+    CHECK(out[0] == 16384);
+    CHECK(out[1] == 8192);
+    CHECK(out[2] == 0);
+    CHECK(out[3] == 0);
+}
+
+// --- Fades ------------------------------------------------------------------
+
+static void TestFaderStartsUntouched() {
+    Fader fader;
+    CHECK(fader.isUnity());
+    CHECK(!fader.isFading());
+    CHECK(fader.audibleFramesLeft() == -1);
+}
+
+static void TestFaderFadesOutAndLimitsAudio() {
+    Fader fader;
+    fader.fadeTo(0.f, 100);
+    CHECK(fader.audibleFramesLeft() == 100);
+
+    GainRamp first = fader.take(40);
+    CHECK(Near(first.start, 1.0));
+    CHECK(first.frames == 40);
+    CHECK(Near(first.end, 0.6));
+    CHECK(fader.audibleFramesLeft() == 60);
+
+    GainRamp rest = fader.take(500);  // More frames than remain in the fade
+    CHECK(rest.frames == 60);
+    CHECK(rest.end == 0.f);
+    CHECK(fader.isSilent());
+    CHECK(fader.audibleFramesLeft() == 0);
+}
+
+static void TestFaderFadesInToUnity() {
+    Fader fader;
+    fader.setLevel(0.f);
+    fader.fadeTo(1.f, 10);
+    CHECK(fader.audibleFramesLeft() == -1);  // Heading up, so no limit on audio
+    fader.take(10);
+    CHECK(fader.isUnity());
+}
+
+static void TestFaderReversesMidFade() {
+    Fader fader;
+    fader.fadeTo(0.f, 100);
+    fader.take(50);                // Halfway down
+    fader.fadeTo(1.f, 50);         // Pause cancelled: back up from 0.5
+    GainRamp ramp = fader.take(50);
+    CHECK(Near(ramp.start, 0.5));
+    CHECK(Near(ramp.step, 0.01));
+    CHECK(fader.isUnity());
+}
+
 // --- Song position ----------------------------------------------------------
 
 static void TestPositionIgnoresLeadingSilence() {
@@ -291,6 +374,7 @@ int main() {
     TestRingStopsWhenFull();
     TestRingWrapsAround();
     TestRingDiscardDropsOnlyOldAudio();
+    TestRingReadStopsAtDiscardMarker();
     TestRingDiscardKeepsSpaceUntilApplied();
     TestRingAcrossThreads();
 
@@ -300,6 +384,12 @@ int main() {
     TestConvert8BitIsCentredOnSilence();
     TestConvertGainLimitsInsteadOfWrapping();
     TestGains();
+    TestConvertAppliesFadeRamp();
+
+    TestFaderStartsUntouched();
+    TestFaderFadesOutAndLimitsAudio();
+    TestFaderFadesInToUnity();
+    TestFaderReversesMidFade();
 
     TestPositionIgnoresLeadingSilence();
     TestPositionStopsAtEndOfAudio();

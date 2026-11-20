@@ -11,6 +11,8 @@
 - **Automatic device recovery.** If the device disconnects, playback waits and continues from the same position as soon as the device returns, however long that takes.
 - If the device disconnects while paused, such as Bluetooth headphones turning off, it reconnects when you unpause.
 - When set to **System default device**, playback follows Windows as the default output changes.
+- **Gapless playback.** When the next track has the same sample rate, channels and bit depth, it continues on the same open stream with no gap or click. Other tracks still play their ending in full before the device reopens.
+- **Click-free pause, seek and stop.** The sound fades out over 15 ms before stopping and fades back in on resume. Normal playback is untouched, so it stays bit-perfect.
 
 ## Install
 1. Copy `out_vibewasapi.dll` into the `Plugins` folder of Winamp or WACUP:
@@ -45,6 +47,7 @@ GitHub runs the same build and tests for both architectures on every push to `ma
 ```
 build\Release\vibe_smoke_host.exe build\Release\out_vibewasapi.dll
 ```
+In exclusive mode the plug-in doesn't resample, so the device must accept the test's sample rate. Add a rate the device supports, for example `48000`, to run every test at that rate.
 
 ## How it works
 Winamp's threads and the audio thread are kept apart, so a slow device can't freeze the player and a busy player can't interrupt the sound.
@@ -54,12 +57,15 @@ Winamp's threads and the audio thread are kept apart, so a slow device can't fre
 3. One MTA render thread makes every playback call to WASAPI. It wakes on the device's event, converts audio from the ring buffer into the device format, and fills any gap with silence.
 4. A device monitor receives Windows notifications when devices appear, disappear, or become the default. The render thread reconnects accordingly.
 5. The plug-in records how much silence went out before real audio. That lets it turn the device clock position into song time exactly, so `GetOutputTime` and `IsPlaying` (used for end-of-track drain) stay correct even after underruns.
+6. Pause, seek and stop first fade the sound to silence and wait until the faded audio has played. Only then is the device stopped and cleared, and playback fades back in if it continues.
+7. For gapless playback, `IsPlaying` reports the end of a track while about 500 ms of audio is still queued, so Winamp starts the next track early. The stream keeps playing that audio after `Close`. If the next `Open` has the same format and settings, the new track's audio follows straight on. Otherwise the old track finishes first and a fresh stream starts.
 
 ### Source files
 | File | Purpose |
 |---|---|
 | `src/plugin.cpp` | The functions Winamp calls, and how they stay thread-safe |
-| `src/render_engine.*` | The real-time audio thread and device recovery |
+| `src/render_engine.*` | The real-time audio thread, fades, gapless handoff and device recovery |
+| `src/fader.h` | The short volume ramps used for click-free pause, seek and stop |
 | `src/wasapi_device.*` | One open connection to a Windows audio device |
 | `src/device_monitor.*` | Windows notifications about device changes |
 | `src/spsc_ring.h` | Lock-free audio buffer between the decoder and audio thread |

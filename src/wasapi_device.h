@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "fader.h"
 #include "position_tracker.h"
 #include "sample_convert.h"
 #include "settings.h"
@@ -24,6 +25,12 @@ struct StreamFormat {
     int channels = 2;
     int bitsPerSample = 16;
     int frameBytes() const { return channels * bitsPerSample / 8; }
+
+    bool operator==(const StreamFormat& other) const {
+        return sampleRate == other.sampleRate && channels == other.channels &&
+               bitsPerSample == other.bitsPerSample;
+    }
+    bool operator!=(const StreamFormat& other) const { return !(*this == other); }
 };
 
 // Creates the Windows object used to find audio devices.
@@ -56,8 +63,10 @@ public:
     void reset();
 
     // Fills all free space in the device buffer from the ring, padding with silence
-    // if the ring runs short. `gains` may be NULL for bit-perfect output.
-    HRESULT fillAvailable(SpscRing& ring, PositionTracker& tracker, const float* gains);
+    // if the ring runs short. `gains` may be NULL for bit-perfect output. `fader`
+    // applies any fade in progress; once it has faded to silence, no more audio is
+    // taken from the ring, so that audio is still there when playback resumes.
+    HRESULT fillAvailable(SpscRing& ring, PositionTracker& tracker, const float* gains, Fader& fader);
 
     // Asks the device a harmless question. A failure means the device has gone away.
     HRESULT checkAlive();
@@ -72,7 +81,7 @@ private:
     HRESULT activateClient();
     HRESULT initializeExclusive();
     HRESULT initializeShared();
-    HRESULT fill(UINT32 frames, SpscRing& ring, PositionTracker& tracker, const float* gains);
+    HRESULT fill(UINT32 frames, SpscRing& ring, PositionTracker& tracker, const float* gains, Fader& fader);
     void buildDescription();
 
     IMMDevice* device_ = NULL;

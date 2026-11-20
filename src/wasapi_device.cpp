@@ -71,6 +71,27 @@ void MakeWaveFormat(WAVEFORMATEXTENSIBLE& wave, const StreamFormat& format, cons
     wave.SubFormat = out.isFloat ? kSubtypeFloat : kSubtypePCM;
 }
 
+// Works around a crash inside Windows itself.
+//
+// Windows loads audiokse.dll into our process to run exclusive-mode streams, and
+// unloads it again when the last exclusive stream closes. That DLL starts a worker
+// thread which can still be running when the DLL is unloaded; the thread then
+// executes memory that no longer holds code, and the whole player crashes. Opening
+// and closing exclusive streams quickly (fast track changes, seeks) makes this likely.
+// It happens with every version of this plug-in and was seen on a Bluetooth device.
+//
+// "Pinning" the DLL tells Windows never to unload it from this process, so the
+// thread always has valid code to run. The cost is a few hundred KB of memory that
+// stays in use until the player exits. It only needs doing once.
+void PinExclusiveModeDriver() {
+    static volatile LONG pinned = 0;
+    if (pinned) return;
+    HMODULE module = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"audiokse.dll", &module))
+        InterlockedExchange(&pinned, 1);
+    // If the DLL is not loaded (other Windows versions or drivers), there is nothing to pin.
+}
+
 }  // namespace
 
 HRESULT CreateDeviceEnumerator(IMMDeviceEnumerator** enumerator) {
@@ -129,7 +150,10 @@ HRESULT WasapiDevice::initializeExclusive() {
                                      period, period, (WAVEFORMATEX*)&wave, NULL);
         }
     }
-    if (SUCCEEDED(hr)) exclusive_ = true;
+    if (SUCCEEDED(hr)) {
+        exclusive_ = true;
+        PinExclusiveModeDriver();  // audiokse.dll is loaded now; keep it loaded
+    }
     return hr;
 }
 
@@ -235,20 +259,29 @@ void WasapiDevice::reset() {
     if (client_) client_->Reset();
 }
 
-HRESULT WasapiDevice::fill(UINT32 frames, SpscRing& ring, PositionTracker& tracker, const float* gains) {
+HRESULT WasapiDevice::fill(UINT32 frames, SpscRing& ring, PositionTracker& tracker, const float* gains, Fader& fader) {
     if (!frames) return S_OK;
 
     BYTE* deviceBuffer = NULL;
     HRESULT hr = render_->GetBuffer(frames, &deviceBuffer);
     if (FAILED(hr)) return hr;
 
-    const size_t bytesRead = ring.read(scratch_.data(), (size_t)frames * format_.frameBytes());
+    // During a fade-out, take only as much audio as the fade still needs.
+    size_t wantedFrames = frames;
+    const long long audibleLeft = fader.audibleFramesLeft();
+    if (audibleLeft >= 0 && (long long)wantedFrames > audibleLeft) wantedFrames = (size_t)audibleLeft;
+
+    const size_t bytesRead = wantedFrames ? ring.read(scratch_.data(), wantedFrames * format_.frameBytes()) : 0;
     const size_t audioFrames = bytesRead / format_.frameBytes();
     const size_t outFrameBytes = (size_t)format_.channels * outFormat_.container / 8;
 
     if (audioFrames) {
+        // A steady full level means no fade, which keeps the bit-perfect path.
+        GainRamp ramp;
+        const bool fading = !fader.isUnity();
+        if (fading) ramp = fader.take((long long)audioFrames);
         ConvertFrames(scratch_.data(), deviceBuffer, audioFrames, format_.bitsPerSample,
-                      format_.channels, outFormat_, gains);
+                      format_.channels, outFormat_, gains, fading ? &ramp : NULL);
     }
     if (audioFrames < frames) {
         memset(deviceBuffer + audioFrames * outFrameBytes, 0, (frames - audioFrames) * outFrameBytes);
@@ -259,7 +292,7 @@ HRESULT WasapiDevice::fill(UINT32 frames, SpscRing& ring, PositionTracker& track
     return hr;
 }
 
-HRESULT WasapiDevice::fillAvailable(SpscRing& ring, PositionTracker& tracker, const float* gains) {
+HRESULT WasapiDevice::fillAvailable(SpscRing& ring, PositionTracker& tracker, const float* gains, Fader& fader) {
     // In exclusive event-driven mode, Windows hands us the entire buffer on every event.
     // In shared mode, part of the buffer may still be waiting to play.
     UINT32 queuedFrames = 0;
@@ -267,7 +300,7 @@ HRESULT WasapiDevice::fillAvailable(SpscRing& ring, PositionTracker& tracker, co
         const HRESULT hr = client_->GetCurrentPadding(&queuedFrames);
         if (FAILED(hr)) return hr;
     }
-    return fill(bufferFrames_ - queuedFrames, ring, tracker, gains);
+    return fill(bufferFrames_ - queuedFrames, ring, tracker, gains, fader);
 }
 
 HRESULT WasapiDevice::checkAlive() {

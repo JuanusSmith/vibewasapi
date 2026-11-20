@@ -53,18 +53,25 @@ inline void WriteIntSample(unsigned char* p, int32_t sample, const OutFormat& fo
 }  // namespace
 
 void ConvertFrames(const unsigned char* in, unsigned char* out, size_t frames,
-                   int inBps, int channels, const OutFormat& format, const float* gains) {
+                   int inBps, int channels, const OutFormat& format, const float* gains,
+                   const GainRamp* ramp) {
     const int inBytes = inBps / 8;
     const int outBytes = format.container / 8;
     const double kToFloat = 1.0 / 2147483648.0;  // Maps 32-bit integers to -1.0..1.0
+    const bool scale = gains || ramp;
 
     for (size_t frame = 0; frame < frames; ++frame) {
+        // The fade level for this frame; 1.0 when there is no fade.
+        double fade = 1.0;
+        if (ramp) fade = frame < ramp->frames ? ramp->start + ramp->step * (double)frame : ramp->end;
+
         for (int channel = 0; channel < channels; ++channel) {
             int32_t sample = ReadSample(in, inBps);
             in += inBytes;
 
-            if (gains) {
-                double scaled = (double)sample * gains[channel];
+            if (scale) {
+                const double gain = (gains ? gains[channel] : 1.0) * fade;
+                double scaled = (double)sample * gain;
                 if (format.isFloat) {
                     float value = (float)(scaled * kToFloat);
                     memcpy(out, &value, 4);

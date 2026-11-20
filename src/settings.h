@@ -15,6 +15,13 @@ struct Settings {
     int volume    = 1;      // 1 = apply Winamp's volume and pan in software
     int ringMs    = 1000;   // Length of our own audio buffer, in milliseconds
     int periodMs  = 0;      // Device period / shared buffer in ms; 0 = device default
+
+    bool operator==(const Settings& other) const {
+        return deviceId == other.deviceId && exclusive == other.exclusive &&
+               fallback == other.fallback && volume == other.volume &&
+               ringMs == other.ringMs && periodMs == other.periodMs;
+    }
+    bool operator!=(const Settings& other) const { return !(*this == other); }
 };
 
 // Allowed ranges for the numeric options.

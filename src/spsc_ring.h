@@ -15,9 +15,13 @@
 //
 // Seeking: a seek must throw away old audio, but only the consumer may move the
 // read position. requestDiscard() therefore leaves a marker saying "everything
-// written so far is stale", and the consumer skips to that marker. The producer
-// keeps counting the stale bytes as occupied until then, so it can never overwrite
-// memory the consumer might still be copying.
+// written so far is stale", and the consumer calls applyDiscard() to skip to it.
+// The producer keeps counting the stale bytes as occupied until then, so it can
+// never overwrite memory the consumer might still be copying.
+//
+// Until the consumer applies the discard, read() still returns stale audio, but
+// never reads past the marker into audio written after the seek. The render
+// thread uses this to fade out the old audio before jumping to the new position.
 #pragma once
 
 #include <atomic>
@@ -64,10 +68,14 @@ public:
     }
 
     // Consumer: copies up to `bytes` out of the ring and returns how many were copied.
+    // Stops at a pending discard marker; see the explanation at the top of the file.
     size_t read(unsigned char* destination, size_t bytes) {
-        applyDiscard();
         const size_t position = readPos_.load(std::memory_order_relaxed);
-        const size_t available = distance(position, writePos_.load(std::memory_order_acquire));
+        size_t available = distance(position, writePos_.load(std::memory_order_acquire));
+        const size_t discard = discardTo_.load(std::memory_order_acquire);
+        if (discard != kNoDiscard && distance(position, discard) <= available) {
+            available = distance(position, discard);
+        }
         if (bytes > available) bytes = available;
         if (!bytes) return 0;
 
