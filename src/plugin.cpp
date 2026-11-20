@@ -13,6 +13,7 @@
 //     Audio calls share it; Open and Close hold it exclusively only for a moment, and
 //     never while waiting for a device, so the interface stays responsive.
 //   * Everything else uses atomic values, which are safe to read from any thread.
+//     The song-time counters live in TrackTimeline (track_timeline.h).
 //
 // Gapless playback works like this:
 //   1. Near the end of a track, IsPlaying reports "finished" while about
@@ -32,6 +33,7 @@
 #include "render_engine.h"
 #include "settings.h"
 #include "spsc_ring.h"
+#include "track_timeline.h"
 #include "version.h"
 
 namespace {
@@ -50,18 +52,8 @@ RenderEngine g_engine;
 SpscRing g_ring;                         // Guarded by g_streamLock when replaced
 StreamFormat g_format;                   // Guarded by g_streamLock
 Settings g_streamSettings;               // Settings of the running stream; guarded by g_lifecycleLock
-std::atomic<bool> g_streamOpen{false};
-std::atomic<int> g_sampleRate{44100};    // Atomic copy for the position functions
-std::atomic<int> g_seekBaseMs{0};        // Song time of the most recent seek
-
-// Frame counters. "Stream" counts run across gapless track changes, "track" counts
-// restart with each track, and both restart at a seek.
-std::atomic<long long> g_streamFramesWritten{0};
-std::atomic<long long> g_trackStartFrame{0};   // Stream frame where the current track begins
-std::atomic<long long> g_trackFramesWritten{0};
-
-// Set when IsPlaying reported the end of the track; cleared when more audio arrives.
-std::atomic<bool> g_endReported{false};
+std::atomic<bool> g_streamOpen{false};   // Winamp may use the stream (Write, IsPlaying...)
+TrackTimeline g_timeline;                // Song time and end-of-track state
 
 std::wstring g_iniPath;                  // Set once in Init, then only read
 
@@ -153,7 +145,7 @@ void WaitForLingeringTail() {
 }
 
 void Config(HWND parent) {
-    ShowConfigDialog(g_module.hDllInstance, parent, g_iniPath, g_engine.statusText());
+    ShowConfigDialog(g_module.hDllInstance, parent, g_iniPath, [] { return g_engine.statusText(); });
 }
 
 void About(HWND parent) {
@@ -197,10 +189,7 @@ int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
     if (g_engine.isLingering()) {
         const bool compatible = params.format == g_format && params.settings == g_streamSettings;
         if (compatible && g_engine.resumeFromLinger()) {
-            g_trackStartFrame.store(g_streamFramesWritten.load());
-            g_trackFramesWritten.store(0);
-            g_seekBaseMs.store(0);
-            g_endReported.store(false);
+            g_timeline.startGaplessTrack();
             g_streamOpen.store(true);
             LeaveCriticalSection(&g_lifecycleLock);
             return g_engine.latencyMs();
@@ -221,12 +210,7 @@ int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
     ReleaseSRWLockExclusive(&g_streamLock);
 
     g_streamSettings = params.settings;
-    g_sampleRate.store(sampleRate);
-    g_streamFramesWritten.store(0);
-    g_trackStartFrame.store(0);
-    g_trackFramesWritten.store(0);
-    g_seekBaseMs.store(0);
-    g_endReported.store(false);
+    g_timeline.startStream(sampleRate);
 
     // This can take a few seconds if the device is busy. Only the lifecycle lock is
     // held, so Pause, volume changes and position updates are not blocked.
@@ -241,7 +225,7 @@ int Open(int sampleRate, int channels, int bitsPerSample, int, int) {
 void Close() {
     EnterCriticalSection(&g_lifecycleLock);
     if (g_streamOpen.load()) {
-        if (g_endReported.load() && g_engine.beginLinger()) DetachStreamLocked();
+        if (g_timeline.endReported() && g_engine.beginLinger()) DetachStreamLocked();
         else CloseStreamLocked(true);
     }
     LeaveCriticalSection(&g_lifecycleLock);
@@ -257,11 +241,7 @@ int Write(char* buffer, int length) {
         const size_t frameBytes = (size_t)g_format.frameBytes();
         const size_t wholeFrames = (size_t)length - (size_t)length % frameBytes;
         const long long written = (long long)(g_ring.write((const unsigned char*)buffer, wholeFrames) / frameBytes);
-        if (written > 0) {
-            g_streamFramesWritten.fetch_add(written);
-            g_trackFramesWritten.fetch_add(written);
-            g_endReported.store(false);  // More audio means this is not the end yet
-        }
+        g_timeline.onWritten(written);
         result = 0;
     }
     ReleaseSRWLockShared(&g_streamLock);
@@ -290,7 +270,7 @@ int IsPlaying() {
     if (g_streamOpen.load()) {
         const long long leadFrames = (long long)g_format.sampleRate * kGaplessLeadMs / 1000;
         result = QueuedFrames() > leadFrames;
-        if (!result) g_endReported.store(true);
+        if (!result) g_timeline.markEndReported();
     }
     ReleaseSRWLockShared(&g_streamLock);
     return result;
@@ -315,11 +295,7 @@ void Flush(int timeMs) {
     EnterCriticalSection(&g_lifecycleLock);
     if (g_streamOpen.load()) {
         g_ring.requestDiscard();
-        g_streamFramesWritten.store(0);
-        g_trackStartFrame.store(0);
-        g_trackFramesWritten.store(0);
-        g_seekBaseMs.store(timeMs);
-        g_endReported.store(false);
+        g_timeline.seek(timeMs);
         g_engine.flush();
     }
     LeaveCriticalSection(&g_lifecycleLock);
@@ -328,18 +304,13 @@ void Flush(int timeMs) {
 // The song time, in ms, that the listener is hearing now.
 int GetOutputTime() {
     if (!g_streamOpen.load()) return 0;
-
-    // Right after a gapless change the previous track may still be audible, so the
-    // new track's time stays at its starting point until its own audio is heard.
-    long long trackFrames = g_engine.playedFrames() - g_trackStartFrame.load();
-    if (trackFrames < 0) trackFrames = 0;
-    return g_seekBaseMs.load() + (int)(trackFrames * 1000 / g_sampleRate.load());
+    return g_timeline.outputTimeMs(g_engine.playedFrames());
 }
 
 // The song time, in ms, of the newest audio Winamp has written.
 int GetWrittenTime() {
     if (!g_streamOpen.load()) return 0;
-    return g_seekBaseMs.load() + (int)(g_trackFramesWritten.load() * 1000 / g_sampleRate.load());
+    return g_timeline.writtenTimeMs();
 }
 
 }  // namespace

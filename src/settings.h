@@ -9,12 +9,12 @@
 #include <string>
 
 struct Settings {
-    std::wstring deviceId;  // Windows endpoint ID; empty means "system default device"
-    int exclusive = 1;      // 1 = ask for exclusive (bit-perfect) device access
-    int fallback  = 1;      // 1 = use shared mode if exclusive mode is refused
-    int volume    = 1;      // 1 = apply Winamp's volume and pan in software
-    int ringMs    = 1000;   // Length of our own audio buffer, in milliseconds
-    int periodMs  = 0;      // Device period / shared buffer in ms; 0 = device default
+    std::wstring deviceId;   // Windows endpoint ID; empty means "system default device"
+    bool exclusive = true;   // Ask for exclusive (bit-perfect) device access
+    bool fallback  = true;   // Use shared mode if exclusive mode is refused
+    bool volume    = true;   // Apply Winamp's volume and pan in software
+    int ringMs     = 1000;   // Length of our own audio buffer, in milliseconds
+    int periodMs   = 0;      // Device period / shared buffer in ms; 0 = device default
 
     bool operator==(const Settings& other) const {
         return deviceId == other.deviceId && exclusive == other.exclusive &&

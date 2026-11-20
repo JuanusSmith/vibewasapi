@@ -3,28 +3,32 @@
 // The window edits its own private copy of the settings and saves them to the ini
 // file when the user clicks OK. A playing stream is unaffected; the next stream reads
 // the new values when it opens.
+//
+// It also shows two kinds of information:
+//   * "Now playing": what the current stream is doing, refreshed twice a second.
+//   * The exclusive-mode formats the selected device accepts, checked when the window
+//     opens and whenever a different device is chosen.
 #include "config_dialog.h"
 
 #include <objbase.h>
-#include <propidl.h>
 #include <mmdeviceapi.h>
-#include <cstdio>
 #include <vector>
 
+#include "playback_status.h"
 #include "resource.h"
 #include "settings.h"
 #include "wasapi_device.h"
 
 namespace {
 
-// Windows property that holds a device's display name, such as "Speakers (USB Audio)".
-const PROPERTYKEY kPKEY_DeviceFriendlyName = {
-    {0xA45C254E, 0xDF1C, 0x4EFD, {0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0}}, 14};
+const UINT_PTR kStatusTimer = 1;
+const UINT kStatusRefreshMs = 500;
 
 // Data that belongs to one open settings window.
 struct DialogState {
     std::wstring iniPath;
-    std::wstring statusText;
+    StatusProvider statusProvider = NULL;
+    std::wstring shownStatus;  // Avoids redrawing (and flickering) when nothing changed
     Settings settings;
     std::vector<std::wstring> deviceIds;  // Same order as the entries in the device list
 };
@@ -47,23 +51,50 @@ void FillDeviceList(HWND combo, std::vector<std::wstring>& deviceIds) {
             if (FAILED(devices->Item(i, &device))) continue;
 
             LPWSTR id = NULL;
-            IPropertyStore* properties = NULL;
-            if (SUCCEEDED(device->GetId(&id)) && SUCCEEDED(device->OpenPropertyStore(STGM_READ, &properties))) {
-                PROPVARIANT name;
-                PropVariantInit(&name);
-                if (SUCCEEDED(properties->GetValue(kPKEY_DeviceFriendlyName, &name)) && name.vt == VT_LPWSTR) {
-                    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)name.pwszVal);
-                    deviceIds.push_back(id);
-                }
-                PropVariantClear(&name);
+            const std::wstring name = DeviceFriendlyName(device);
+            if (SUCCEEDED(device->GetId(&id)) && !name.empty()) {
+                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)name.c_str());
+                deviceIds.push_back(id);
             }
-            if (properties) properties->Release();
             if (id) CoTaskMemFree(id);
             device->Release();
         }
         devices->Release();
     }
     enumerator->Release();
+}
+
+// Shows the latest playback status, if it has changed.
+void RefreshStatus(HWND dialog, DialogState& state) {
+    const std::wstring status = state.statusProvider ? state.statusProvider() : L"";
+    if (status == state.shownStatus) return;
+    state.shownStatus = status;
+    SetDlgItemTextW(dialog, IDC_STATUS, status.c_str());
+}
+
+// Lists the exclusive-mode formats of the device chosen in the device list.
+void RefreshFormats(HWND dialog, DialogState& state) {
+    const int selected = (int)SendDlgItemMessageW(dialog, IDC_DEVICE, CB_GETCURSEL, 0, 0);
+    const std::wstring deviceId =
+        (selected > 0 && selected < (int)state.deviceIds.size()) ? state.deviceIds[selected] : L"";
+
+    // Checking a Bluetooth device can take a moment, so show that something is happening.
+    SetDlgItemTextW(dialog, IDC_FORMATS, L"Checking...");
+    UpdateWindow(GetDlgItem(dialog, IDC_FORMATS));  // Draw it now; the check below blocks
+    HCURSOR previous = SetCursor(LoadCursor(NULL, IDC_WAIT));
+
+    std::wstring text;
+    IMMDeviceEnumerator* enumerator = NULL;
+    HRESULT hr = CreateDeviceEnumerator(&enumerator);
+    std::vector<RateSupport> rates;
+    if (SUCCEEDED(hr)) {
+        hr = ProbeExclusiveFormats(enumerator, deviceId, 2, rates);
+        enumerator->Release();
+    }
+    text = DescribeExclusiveFormats(hr, rates);
+
+    SetCursor(previous);
+    SetDlgItemTextW(dialog, IDC_FORMATS, text.c_str());
 }
 
 // Copies the settings into the window's controls.
@@ -86,10 +117,9 @@ void PopulateControls(HWND dialog, DialogState& state) {
     // The fallback option only means something when exclusive mode is requested.
     EnableWindow(GetDlgItem(dialog, IDC_FALLBACK), state.settings.exclusive);
 
-    wchar_t status[256];
-    _snwprintf(status, 255, L"%s\nChanges apply from the next track.", state.statusText.c_str());
-    status[255] = 0;
-    SetDlgItemTextW(dialog, IDC_STATUS, status);
+    RefreshStatus(dialog, state);
+    RefreshFormats(dialog, state);
+    SetTimer(dialog, kStatusTimer, kStatusRefreshMs, NULL);
 }
 
 // Reads the window's controls and saves the result.
@@ -114,9 +144,22 @@ INT_PTR CALLBACK DialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
     }
 
     DialogState* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog, DWLP_USER));
-    if (message != WM_COMMAND || !state) return FALSE;
+    if (!state) return FALSE;
+
+    if (message == WM_TIMER && wParam == kStatusTimer) {
+        RefreshStatus(dialog, *state);
+        return TRUE;
+    }
+    if (message == WM_DESTROY) {
+        KillTimer(dialog, kStatusTimer);
+        return FALSE;
+    }
+    if (message != WM_COMMAND) return FALSE;
 
     switch (LOWORD(wParam)) {
+    case IDC_DEVICE:
+        if (HIWORD(wParam) == CBN_SELCHANGE) RefreshFormats(dialog, *state);
+        return TRUE;
     case IDC_EXCLUSIVE:
         EnableWindow(GetDlgItem(dialog, IDC_FALLBACK), IsDlgButtonChecked(dialog, IDC_EXCLUSIVE) == BST_CHECKED);
         return TRUE;
@@ -134,10 +177,10 @@ INT_PTR CALLBACK DialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
 }  // namespace
 
 void ShowConfigDialog(HINSTANCE instance, HWND parent, const std::wstring& iniPath,
-                      const std::wstring& statusText) {
+                      StatusProvider statusProvider) {
     DialogState state;
     state.iniPath = iniPath;
-    state.statusText = statusText;
+    state.statusProvider = statusProvider;
     state.settings = LoadSettings(iniPath);
 
     const HRESULT comResult = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);

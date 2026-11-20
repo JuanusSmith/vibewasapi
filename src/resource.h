@@ -7,3 +7,4 @@
 #define IDC_PERIODMS    1005
 #define IDC_VOLUME      1006
 #define IDC_STATUS      1007
+#define IDC_FORMATS     1008

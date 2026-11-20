@@ -9,6 +9,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")  # stati
 add_library(out_vibewasapi SHARED
   src/config_dialog.cpp
   src/device_monitor.cpp
+  src/playback_status.cpp
   src/plugin.cpp
   src/render_engine.cpp
   src/sample_convert.cpp
@@ -25,7 +26,7 @@ endif()
 
 # Automated tests that need no sound card. Run them with: ctest -C Release
 enable_testing()
-add_executable(vibe_unit_tests tests/unit_tests.cpp src/sample_convert.cpp src/settings.cpp)
+add_executable(vibe_unit_tests tests/unit_tests.cpp src/playback_status.cpp src/sample_convert.cpp src/settings.cpp)
 target_include_directories(vibe_unit_tests PRIVATE src)
 add_test(NAME unit_tests COMMAND vibe_unit_tests)
 

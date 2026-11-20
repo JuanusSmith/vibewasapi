@@ -17,7 +17,7 @@
 //   d. If playback continues, fade back in from silence.
 #include "render_engine.h"
 
-#include <cstdio>
+#include "playback_status.h"
 
 namespace {
 
@@ -83,10 +83,8 @@ HRESULT RenderEngine::start(const StreamParams& params) {
     const HRESULT hr = startResult_.load();
     if (FAILED(hr)) {
         stop(false);
-        wchar_t text[64];
-        _snwprintf(text, 63, L"Open failed (0x%08lX)", (unsigned long)hr);
-        text[63] = 0;
-        setStatusText(text);
+        setStatusText(L"The device couldn't be opened: " +
+                      DescribeOpenError(hr, params.format.sampleRate, params.format.channels));
     }
     return hr;
 }
@@ -142,14 +140,33 @@ bool RenderEngine::resumeFromLinger() {
 
 std::wstring RenderEngine::statusText() const {
     AcquireSRWLockShared(&statusLock_);
-    std::wstring copy = status_;
+    const bool showPlayback = showPlayback_;
+    PlaybackStatus playback = playback_;
+    const bool volumeOption = playbackVolumeOption_;
+    std::wstring message = status_;
     ReleaseSRWLockShared(&statusLock_);
-    return copy;
+
+    if (!showPlayback) return message;
+
+    // Volume, pan and pause can change at any moment, so check them now rather than at open.
+    float gains[8];
+    playback.softwareVolume = volumeOption && ComputeGains(volume_.load(), pan_.load(), playback.channels, gains);
+    playback.paused = control_.wantPaused();
+    return DescribePlayback(playback);
 }
 
 void RenderEngine::setStatusText(const std::wstring& text) {
     AcquireSRWLockExclusive(&statusLock_);
     status_ = text;
+    showPlayback_ = false;
+    ReleaseSRWLockExclusive(&statusLock_);
+}
+
+void RenderEngine::setPlaybackStatus(const PlaybackStatus& playback, bool volumeOption) {
+    AcquireSRWLockExclusive(&statusLock_);
+    playback_ = playback;
+    playbackVolumeOption_ = volumeOption;
+    showPlayback_ = true;
     ReleaseSRWLockExclusive(&statusLock_);
 }
 
@@ -255,7 +272,7 @@ HRESULT RenderEngine::openAndStart() {
         return hr;
     }
     latencyMs_.store(device_.latencyMs());
-    setStatusText(device_.description());
+    setPlaybackStatus(device_.status(), params_.settings.volume);
     return S_OK;
 }
 

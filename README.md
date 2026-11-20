@@ -13,6 +13,8 @@
 - When set to **System default device**, playback follows Windows as the default output changes.
 - **Gapless playback.** When the next track has the same sample rate, channels and bit depth, it continues on the same open stream with no gap or click. Other tracks still play their ending in full before the device reopens.
 - **Click-free pause, seek and stop.** The sound fades out over 15 ms before stopping and fades back in on resume. Normal playback is untouched, so it stays bit-perfect.
+- **Dither.** When audio has to lose detail, such as a 24-bit track on a device that only accepts 16-bit, or volume applied in software, it adds TPDF dither, so quiet passages and fade-outs stay clean. Bit-perfect playback is never touched.
+- **Clear status in the settings window.** The Now playing box shows the device, exclusive or shared mode, the format, and whether playback is bit-perfect or dithered. It updates live. If exclusive mode was requested but not used, it says why. A second box lists the formats the selected device accepts in exclusive mode.
 
 ## Install
 1. Copy `out_vibewasapi.dll` into the `Plugins` folder of Winamp or WACUP:
@@ -71,7 +73,9 @@ Winamp's threads and the audio thread are kept apart, so a slow device can't fre
 | `src/spsc_ring.h` | Lock-free audio buffer between the decoder and audio thread |
 | `src/stream_control.h` | Pause and seek requests between threads |
 | `src/position_tracker.h` | Converts the device clock into song time |
-| `src/sample_convert.*` | Audio format conversion, volume and pan |
+| `src/track_timeline.h` | The song time Winamp sees, across seeks and gapless track changes |
+| `src/sample_convert.*` | Audio format conversion, volume, pan and dither |
+| `src/playback_status.*` | The plain-language status and format list in the settings window |
 | `src/settings.*` | Loading and saving options |
 | `src/config_dialog.*` | The settings window |
 | `src/version.h` | The version number used throughout the plug-in |
@@ -79,9 +83,7 @@ Winamp's threads and the audio thread are kept apart, so a slow device can't fre
 
 ## Ideas for future versions
 - Reopen the device immediately when settings change, instead of waiting for the next track.
-- Add TPDF dither when the device format has fewer bits than the source (rare: only when a device accepts 16-bit and nothing else).
 - Add an option for 24-bit and higher output in shared mode when the device can't use exclusive mode.
-- Add a unicode description (OUT_VER_U) for newer WACUP builds.
 
 ## License
 

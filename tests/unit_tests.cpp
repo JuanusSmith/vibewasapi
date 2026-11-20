@@ -14,12 +14,16 @@
 #include <thread>
 #include <vector>
 
+#include <audioclient.h>
+
 #include "fader.h"
+#include "playback_status.h"
 #include "position_tracker.h"
 #include "sample_convert.h"
 #include "settings.h"
 #include "spsc_ring.h"
 #include "stream_control.h"
+#include "track_timeline.h"
 
 static int g_failures = 0;
 
@@ -233,6 +237,218 @@ static void TestConvertAppliesFadeRamp() {
     CHECK(out[3] == 0);
 }
 
+// --- Dither -----------------------------------------------------------------
+
+static void TestNeedsDitherOnlyWhenDetailIsLost() {
+    CHECK(!NeedsDither(16, OutFormat{16, 16, false}, false));  // Bit-perfect
+    CHECK(!NeedsDither(24, OutFormat{32, 24, false}, false));  // 24-in-32 holds 24 bits
+    CHECK(NeedsDither(24, OutFormat{16, 16, false}, false));   // 24 -> 16 loses 8 bits
+    CHECK(NeedsDither(16, OutFormat{16, 16, false}, true));    // Volume adds fractions
+    CHECK(!NeedsDither(24, OutFormat{32, 32, true}, true));    // Float keeps the detail
+    CHECK(!NeedsDither(32, OutFormat{32, 32, false}, true));   // 32-bit is far below hearing
+}
+
+static void TestDitherLeavesBitPerfectAudioAlone() {
+    const int16_t in[4] = {0, 1, -1, 32767};
+    int16_t out[4] = {0};
+    DitherState dither;
+    ConvertFrames((const unsigned char*)in, (unsigned char*)out, 2, 16, 2, OutFormat{16, 16, false}, NULL, NULL, &dither);
+    CHECK(memcmp(in, out, sizeof(in)) == 0);
+}
+
+// Builds 24-bit little-endian samples that all hold `value`.
+static std::vector<unsigned char> Make24Bit(int value, size_t count) {
+    std::vector<unsigned char> bytes(count * 3);
+    for (size_t i = 0; i < count; ++i) {
+        bytes[i * 3] = (unsigned char)value;
+        bytes[i * 3 + 1] = (unsigned char)(value >> 8);
+        bytes[i * 3 + 2] = (unsigned char)(value >> 16);
+    }
+    return bytes;
+}
+
+static void TestDitherStaysWithinOneStep() {
+    // 24-bit 1000.25 steps of 16-bit audio: each output must be 999, 1000, 1001 or 1002 at most.
+    const size_t count = 5000;
+    const std::vector<unsigned char> in = Make24Bit(1000 * 256 + 64, count);
+    std::vector<int16_t> out(count);
+    DitherState dither;
+    ConvertFrames(in.data(), (unsigned char*)out.data(), count, 24, 1, OutFormat{16, 16, false}, NULL, NULL, &dither);
+    bool inRange = true, varies = false;
+    for (size_t i = 0; i < count; ++i) {
+        if (fabs(out[i] - 1000.25) >= 1.5) inRange = false;
+        if (out[i] != out[0]) varies = true;
+    }
+    CHECK(inRange);
+    CHECK(varies);  // The noise is really being added
+}
+
+static void TestDitherKeepsDetailBelowTheLastBit() {
+    // A level of 1000.25 steps can't be stored in 16 bits. Without dither every sample
+    // becomes 1000, losing the quarter step; with dither the average keeps it.
+    const size_t count = 40000;
+    const std::vector<unsigned char> in = Make24Bit(1000 * 256 + 64, count);
+    std::vector<int16_t> out(count);
+
+    ConvertFrames(in.data(), (unsigned char*)out.data(), count, 24, 1, OutFormat{16, 16, false}, NULL);
+    double plainSum = 0;
+    for (size_t i = 0; i < count; ++i) plainSum += out[i];
+    CHECK(Near(plainSum / count, 1000.0));
+
+    DitherState dither;
+    ConvertFrames(in.data(), (unsigned char*)out.data(), count, 24, 1, OutFormat{16, 16, false}, NULL, NULL, &dither);
+    double ditheredSum = 0;
+    for (size_t i = 0; i < count; ++i) ditheredSum += out[i];
+    CHECK(fabs(ditheredSum / count - 1000.25) < 0.02);
+}
+
+static void TestDitherOfSilenceIsOnlyTheSmallestStep() {
+    const int16_t in[1000] = {0};
+    int16_t out[1000];
+    const float gain[1] = {0.5f};
+    DitherState dither;
+    ConvertFrames((const unsigned char*)in, (unsigned char*)out, 1000, 16, 1, OutFormat{16, 16, false}, gain, NULL, &dither);
+    bool tiny = true;
+    for (int i = 0; i < 1000; ++i) {
+        if (out[i] < -1 || out[i] > 1) tiny = false;
+    }
+    CHECK(tiny);
+}
+
+static void TestDitherStillLimitsLoudAudio() {
+    const int16_t in[2] = {32767, -32768};
+    const float gain[1] = {4.0f};
+    int16_t out[2] = {0};
+    DitherState dither;
+    ConvertFrames((const unsigned char*)in, (unsigned char*)out, 2, 16, 1, OutFormat{16, 16, false}, gain, NULL, &dither);
+    CHECK(out[0] == 32767);
+    CHECK(out[1] == -32768);
+}
+
+// --- Status text ------------------------------------------------------------
+
+static bool Contains(const std::wstring& text, const wchar_t* part) {
+    return text.find(part) != std::wstring::npos;
+}
+
+static void TestDescribeRatesAndFormats() {
+    CHECK(DescribeRate(44100) == L"44.1 kHz");
+    CHECK(DescribeRate(48000) == L"48 kHz");
+    CHECK(DescribeRate(176400) == L"176.4 kHz");
+    CHECK(DescribeSampleFormat(OutFormat{16, 16, false}) == L"16-bit");
+    CHECK(DescribeSampleFormat(OutFormat{32, 24, false}) == L"24-bit in 32");
+    CHECK(DescribeSampleFormat(OutFormat{32, 32, true}) == L"32-bit float");
+}
+
+static void TestStatusShowsBitPerfect() {
+    PlaybackStatus status;
+    status.deviceName = L"Headphones (U18)";
+    status.exclusive = true;
+    status.sampleRate = 48000;
+    status.sourceBits = 16;
+    status.out = OutFormat{16, 16, false};
+    status.latencyMs = 30;
+    const std::wstring text = DescribePlayback(status);
+    CHECK(Contains(text, L"Headphones (U18): exclusive mode, 48 kHz, 16-bit, stereo, 30 ms latency."));
+    CHECK(Contains(text, L"Bit-perfect"));
+
+    status.softwareVolume = true;  // Turning the volume down ends bit-perfect playback
+    CHECK(Contains(DescribePlayback(status), L"volume is applied in software, with dither"));
+
+    CHECK(!Contains(text, L"Paused"));
+    status.paused = true;
+    CHECK(Contains(DescribePlayback(status), L"30 ms latency. Paused."));
+}
+
+static void TestStatusShowsReducedBitDepth() {
+    PlaybackStatus status;
+    status.exclusive = true;
+    status.sampleRate = 48000;
+    status.sourceBits = 24;
+    status.out = OutFormat{16, 16, false};
+    const std::wstring text = DescribePlayback(status);
+    CHECK(Contains(text, L"The 24-bit source is reduced to 16-bit, with dither."));
+    CHECK(!Contains(text, L"Bit-perfect"));
+}
+
+static void TestStatusExplainsFallback() {
+    PlaybackStatus status;
+    status.exclusive = false;
+    status.exclusiveError = AUDCLNT_E_UNSUPPORTED_FORMAT;
+    status.sampleRate = 44100;
+    const std::wstring text = DescribePlayback(status);
+    CHECK(Contains(text, L"shared mode"));
+    CHECK(Contains(text, L"Exclusive mode wasn't used: the device doesn't accept 44.1 kHz stereo audio in exclusive mode."));
+
+    CHECK(Contains(DescribeOpenError(AUDCLNT_E_DEVICE_IN_USE, 44100, 2), L"another app"));
+    CHECK(Contains(DescribeOpenError(E_FAIL, 44100, 2), L"0x80004005"));
+}
+
+static void TestDescribeExclusiveFormats() {
+    std::vector<RateSupport> rates(2);
+    rates[0].sampleRate = 44100;
+    rates[1].sampleRate = 48000;
+    rates[1].formats.push_back(OutFormat{16, 16, false});
+    rates[1].formats.push_back(OutFormat{32, 32, true});
+    const std::wstring text = DescribeExclusiveFormats(S_OK, rates);
+    CHECK(Contains(text, L"44.1 kHz: not accepted\r\n"));
+    CHECK(text == L"44.1 kHz: not accepted\r\n48 kHz: 16-bit, 32-bit float");
+
+    rates[1].formats.clear();
+    CHECK(Contains(DescribeExclusiveFormats(S_OK, rates), L"use shared mode"));
+    CHECK(Contains(DescribeExclusiveFormats(AUDCLNT_E_DEVICE_IN_USE, rates), L"Stop playback"));
+}
+
+// --- Track timeline ---------------------------------------------------------
+
+static void TestTimelineCountsAFreshTrack() {
+    TrackTimeline timeline;
+    timeline.startStream(48000);
+    timeline.onWritten(96000);                     // Two seconds written
+    CHECK(timeline.writtenTimeMs() == 2000);
+    CHECK(timeline.outputTimeMs(24000) == 500);    // Half a second heard
+}
+
+static void TestTimelineGaplessTrackStartsAtZero() {
+    TrackTimeline timeline;
+    timeline.startStream(48000);
+    timeline.onWritten(480000);                    // Track 1: ten seconds
+    timeline.startGaplessTrack();
+    timeline.onWritten(48000);                     // Track 2: one second so far
+
+    // The listener is still hearing the end of track 1, so track 2 shows 0:00.
+    CHECK(timeline.outputTimeMs(470000) == 0);
+    // Once playback passes the join, track 2's own time counts up.
+    CHECK(timeline.outputTimeMs(480000 + 24000) == 500);
+    CHECK(timeline.writtenTimeMs() == 1000);
+}
+
+static void TestTimelineSeekAddsTheTarget() {
+    TrackTimeline timeline;
+    timeline.startStream(44100);
+    timeline.onWritten(441000);
+    timeline.seek(90000);                          // Seek to 1:30
+    CHECK(timeline.outputTimeMs(0) == 90000);
+    timeline.onWritten(44100);
+    CHECK(timeline.writtenTimeMs() == 91000);
+    CHECK(timeline.outputTimeMs(22050) == 90500);
+}
+
+static void TestTimelineEndReportClearsOnNewAudio() {
+    TrackTimeline timeline;
+    timeline.startStream(44100);
+    CHECK(!timeline.endReported());
+    timeline.markEndReported();
+    CHECK(timeline.endReported());
+    timeline.onWritten(0);                         // Nothing written: still the end
+    CHECK(timeline.endReported());
+    timeline.onWritten(100);                       // More audio: not the end after all
+    CHECK(!timeline.endReported());
+    timeline.markEndReported();
+    timeline.startGaplessTrack();                  // A new track is never "ended"
+    CHECK(!timeline.endReported());
+}
+
 // --- Fades ------------------------------------------------------------------
 
 static void TestFaderStartsUntouched() {
@@ -354,9 +570,9 @@ static void TestSettingsSurviveSaveAndLoad() {
 
     Settings saved;
     saved.deviceId = L"{test-device}";
-    saved.exclusive = 0;
-    saved.fallback = 0;
-    saved.volume = 0;
+    saved.exclusive = false;
+    saved.fallback = false;
+    saved.volume = false;
     saved.ringMs = 750;
     saved.periodMs = 20;
     SaveSettings(path, saved);
@@ -364,7 +580,7 @@ static void TestSettingsSurviveSaveAndLoad() {
     const Settings loaded = LoadSettings(path);
     DeleteFileW(path);
     CHECK(loaded.deviceId == saved.deviceId);
-    CHECK(loaded.exclusive == 0 && loaded.fallback == 0 && loaded.volume == 0);
+    CHECK(!loaded.exclusive && !loaded.fallback && !loaded.volume);
     CHECK(loaded.ringMs == 750);
     CHECK(loaded.periodMs == 20);
 }
@@ -386,6 +602,19 @@ int main() {
     TestGains();
     TestConvertAppliesFadeRamp();
 
+    TestNeedsDitherOnlyWhenDetailIsLost();
+    TestDitherLeavesBitPerfectAudioAlone();
+    TestDitherStaysWithinOneStep();
+    TestDitherKeepsDetailBelowTheLastBit();
+    TestDitherOfSilenceIsOnlyTheSmallestStep();
+    TestDitherStillLimitsLoudAudio();
+
+    TestDescribeRatesAndFormats();
+    TestStatusShowsBitPerfect();
+    TestStatusShowsReducedBitDepth();
+    TestStatusExplainsFallback();
+    TestDescribeExclusiveFormats();
+
     TestFaderStartsUntouched();
     TestFaderFadesOutAndLimitsAudio();
     TestFaderFadesInToUnity();
@@ -394,6 +623,11 @@ int main() {
     TestPositionIgnoresLeadingSilence();
     TestPositionStopsAtEndOfAudio();
     TestPositionContinuesAfterDeviceChange();
+
+    TestTimelineCountsAFreshTrack();
+    TestTimelineGaplessTrackStartsAtZero();
+    TestTimelineSeekAddsTheTarget();
+    TestTimelineEndReportClearsOnNewAudio();
 
     TestPauseKeepsNewestRequest();
     TestFlushRequestsAreNotLost();

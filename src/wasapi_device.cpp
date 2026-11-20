@@ -33,6 +33,15 @@ const IID kIID_IAudioClient = {0x1CB9AD4C, 0xDBFA, 0x4C32, {0xB1, 0x78, 0xC2, 0x
 const IID kIID_IAudioRenderClient = {0xF294ACFC, 0x3146, 0x4483, {0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2}};
 const IID kIID_IAudioClock = {0xCD63314F, 0x3FBA, 0x4A1B, {0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7}};
 
+// Windows property that holds a device's display name, such as "Speakers (USB Audio)".
+const PROPERTYKEY kPKEY_DeviceFriendlyName = {
+    {0xA45C254E, 0xDF1C, 0x4EFD, {0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0}}, 14};
+
+// Every sample format the plug-in can send in exclusive mode, in the order the
+// settings window lists them.
+const OutFormat kAllOutFormats[] = {
+    {16, 16, false}, {24, 24, false}, {32, 24, false}, {32, 32, false}, {32, 32, true}};
+
 template <class T>
 void SafeRelease(T*& pointer) {
     if (pointer) {
@@ -94,6 +103,8 @@ void PinExclusiveModeDriver() {
 
 }  // namespace
 
+// --- Device queries (any thread) ---------------------------------------------
+
 HRESULT CreateDeviceEnumerator(IMMDeviceEnumerator** enumerator) {
     return CoCreateInstance(kCLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, kIID_IMMDeviceEnumerator,
                             (void**)enumerator);
@@ -104,6 +115,61 @@ bool IsTransientOpenError(HRESULT hr) {
            hr == AUDCLNT_E_SERVICE_NOT_RUNNING || hr == AUDCLNT_E_ENDPOINT_CREATE_FAILED ||
            hr == AUDCLNT_E_RESOURCES_INVALIDATED || hr == E_NOTFOUND;
 }
+
+std::wstring DeviceFriendlyName(IMMDevice* device) {
+    std::wstring name;
+    IPropertyStore* properties = NULL;
+    if (device && SUCCEEDED(device->OpenPropertyStore(STGM_READ, &properties))) {
+        PROPVARIANT value;
+        PropVariantInit(&value);
+        if (SUCCEEDED(properties->GetValue(kPKEY_DeviceFriendlyName, &value)) && value.vt == VT_LPWSTR)
+            name = value.pwszVal;
+        PropVariantClear(&value);
+        properties->Release();
+    }
+    return name;
+}
+
+const int kProbeRates[] = {44100, 48000, 88200, 96000, 176400, 192000};
+const int kProbeRateCount = sizeof(kProbeRates) / sizeof(kProbeRates[0]);
+
+HRESULT ProbeExclusiveFormats(IMMDeviceEnumerator* enumerator, const std::wstring& deviceId,
+                              int channels, std::vector<RateSupport>& rates) {
+    rates.clear();
+    IMMDevice* device = NULL;
+    HRESULT hr = deviceId.empty() ? enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device)
+                                  : enumerator->GetDevice(deviceId.c_str(), &device);
+    IAudioClient* client = NULL;
+    if (SUCCEEDED(hr)) hr = device->Activate(kIID_IAudioClient, CLSCTX_ALL, NULL, (void**)&client);
+
+    // Asking about a format plays nothing and leaves the device as it was.
+    for (int r = 0; r < kProbeRateCount && SUCCEEDED(hr); ++r) {
+        RateSupport support;
+        support.sampleRate = kProbeRates[r];
+        StreamFormat format;
+        format.sampleRate = kProbeRates[r];
+        format.channels = channels;
+        for (const OutFormat& candidate : kAllOutFormats) {
+            WAVEFORMATEXTENSIBLE wave;
+            MakeWaveFormat(wave, format, candidate);
+            const HRESULT answer = client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&wave, NULL);
+            if (answer == S_OK) {
+                support.formats.push_back(candidate);
+            } else if (answer != AUDCLNT_E_UNSUPPORTED_FORMAT && answer != S_FALSE) {
+                hr = answer;  // Not "no", but "can't tell", e.g. the device is busy
+                break;
+            }
+        }
+        rates.push_back(support);
+    }
+
+    SafeRelease(client);
+    SafeRelease(device);
+    if (FAILED(hr)) rates.clear();
+    return hr;
+}
+
+// --- WasapiDevice (render thread only) ----------------------------------------
 
 HRESULT WasapiDevice::activateClient() {
     return device_->Activate(kIID_IAudioClient, CLSCTX_ALL, NULL, (void**)&client_);
@@ -193,10 +259,12 @@ HRESULT WasapiDevice::open(IMMDeviceEnumerator* enumerator, const Settings& sett
         hr = activateClient();
     }
 
+    HRESULT exclusiveError = S_OK;  // Kept so the settings window can say why it fell back
     if (SUCCEEDED(hr)) {
         if (settings_.exclusive) {
             hr = initializeExclusive();
             if (FAILED(hr) && settings_.fallback) {
+                exclusiveError = hr;
                 // A client can only be initialized once, so shared mode needs a new one.
                 SafeRelease(client_);
                 hr = activateClient();
@@ -226,7 +294,7 @@ HRESULT WasapiDevice::open(IMMDeviceEnumerator* enumerator, const Settings& sett
     client_->GetStreamLatency(&streamLatency);
     latencyMs_ = (int)((long long)bufferFrames_ * 1000 / format_.sampleRate + streamLatency / 10000);
     scratch_.resize((size_t)bufferFrames_ * format_.frameBytes());
-    buildDescription();
+    buildStatus(exclusiveError);
     return S_OK;
 }
 
@@ -280,8 +348,9 @@ HRESULT WasapiDevice::fill(UINT32 frames, SpscRing& ring, PositionTracker& track
         GainRamp ramp;
         const bool fading = !fader.isUnity();
         if (fading) ramp = fader.take((long long)audioFrames);
+        // Dither is only used when detail is lost (see sample_convert.h).
         ConvertFrames(scratch_.data(), deviceBuffer, audioFrames, format_.bitsPerSample,
-                      format_.channels, outFormat_, gains, fading ? &ramp : NULL);
+                      format_.channels, outFormat_, gains, fading ? &ramp : NULL, &dither_);
     }
     if (audioFrames < frames) {
         memset(deviceBuffer + audioFrames * outFrameBytes, 0, (frames - audioFrames) * outFrameBytes);
@@ -332,18 +401,15 @@ bool WasapiDevice::isSystemDefault(IMMDeviceEnumerator* enumerator) const {
     return same;
 }
 
-// Builds the text shown in the settings window.
-void WasapiDevice::buildDescription() {
-    wchar_t sampleText[48];
-    if (outFormat_.isFloat) _snwprintf(sampleText, 47, L"32-bit float");
-    else if (outFormat_.container != outFormat_.valid) _snwprintf(sampleText, 47, L"%d-bit in %d", outFormat_.valid, outFormat_.container);
-    else _snwprintf(sampleText, 47, L"%d-bit", outFormat_.valid);
-    sampleText[47] = 0;
-
-    wchar_t text[160];
-    _snwprintf(text, 159, L"Now: %s, %s, %d Hz, %d ch, %u-frame buffer (%d ms)",
-               exclusive_ ? L"exclusive" : L"shared", sampleText, format_.sampleRate,
-               format_.channels, bufferFrames_, latencyMs_);
-    text[159] = 0;
-    description_ = text;
+// Records the facts the settings window shows about this stream.
+void WasapiDevice::buildStatus(HRESULT exclusiveError) {
+    status_ = PlaybackStatus();
+    status_.deviceName = DeviceFriendlyName(device_);
+    status_.exclusive = exclusive_;
+    status_.exclusiveError = exclusiveError;
+    status_.sampleRate = format_.sampleRate;
+    status_.channels = format_.channels;
+    status_.sourceBits = format_.bitsPerSample;
+    status_.out = outFormat_;
+    status_.latencyMs = latencyMs_;
 }

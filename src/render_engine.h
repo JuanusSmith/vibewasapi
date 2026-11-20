@@ -79,8 +79,12 @@ public:
 
     int latencyMs() const { return latencyMs_.load(); }
 
-    // Thread-safe access to the status text shown in the settings window.
+    // The status shown in the settings window, safe to call from any thread. While a
+    // stream is open it describes the stream (see playback_status.h), including
+    // whether volume is being applied in software right now.
     std::wstring statusText() const;
+
+    // Replaces the status with a message such as "Not playing".
     void setStatusText(const std::wstring& text);
 
 private:
@@ -107,6 +111,7 @@ private:
     void onDeviceLost();
     void tryReopen();
     void publishPosition();
+    void setPlaybackStatus(const PlaybackStatus& playback, bool volumeOption);
 
     // Signalling events. They last as long as the plug-in, so a late call from Winamp
     // can never use a handle that has already been closed.
@@ -129,8 +134,13 @@ private:
     std::atomic<int> pan_{0};
     std::atomic<int> latencyMs_{0};
 
+    // The settings window's status. When `showPlayback_` is true the status describes
+    // `playback_`; otherwise it is the message in `status_`. Guarded by statusLock_.
     mutable SRWLOCK statusLock_ = SRWLOCK_INIT;
     std::wstring status_ = L"Not playing";
+    PlaybackStatus playback_;
+    bool showPlayback_ = false;
+    bool playbackVolumeOption_ = false;  // The "apply volume in software" setting of that stream
 
     // Used only by the render thread while a stream is running.
     StreamParams params_;

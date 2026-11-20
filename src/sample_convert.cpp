@@ -50,15 +50,52 @@ inline void WriteIntSample(unsigned char* p, int32_t sample, const OutFormat& fo
     }
 }
 
+// Returns a random number from 0 up to (not including) 1. This is "xorshift", a very
+// fast generator that is plenty random for noise, and safe on the real-time thread.
+inline double NextRandom(DitherState& state) {
+    unsigned int x = state.seed;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    state.seed = x;
+    return (double)(x >> 8) * (1.0 / 16777216.0);  // Top 24 bits, scaled into 0..1
+}
+
+// Rounds a left-aligned sample (see the top of this file) to the device's bit depth.
+// `step` is the size of one step of the device's smallest bit in that 32-bit scale,
+// for example 65536 for 16-bit output.
+inline int32_t Requantize(double value, double step, DitherState* dither) {
+    // Two random numbers from 0..1, minus 1, give triangular noise from -1 to +1 step.
+    if (dither) value += (NextRandom(*dither) + NextRandom(*dither) - 1.0) * step;
+
+    double rounded = floor(value / step + 0.5) * step;
+    // Limit the result so a large value cannot wrap around into a loud click. The top
+    // limit is the largest value the device format can hold.
+    const double highest = 2147483648.0 - step;
+    if (rounded > highest) rounded = highest;
+    if (rounded < -2147483648.0) rounded = -2147483648.0;
+    return (int32_t)rounded;
+}
+
 }  // namespace
+
+bool NeedsDither(int inBps, const OutFormat& format, bool scaling) {
+    if (format.isFloat || format.valid >= 32) return false;
+    return scaling || inBps > format.valid;
+}
 
 void ConvertFrames(const unsigned char* in, unsigned char* out, size_t frames,
                    int inBps, int channels, const OutFormat& format, const float* gains,
-                   const GainRamp* ramp) {
+                   const GainRamp* ramp, DitherState* dither) {
     const int inBytes = inBps / 8;
     const int outBytes = format.container / 8;
     const double kToFloat = 1.0 / 2147483648.0;  // Maps 32-bit integers to -1.0..1.0
     const bool scale = gains || ramp;
+
+    // When detail is lost, every sample goes through Requantize instead of the paths
+    // below. `step` is one step of the device's smallest bit, e.g. 2^16 for 16-bit.
+    const bool requantize = NeedsDither(inBps, format, scale);
+    const double step = requantize ? (double)(1u << (32 - format.valid)) : 1.0;
 
     for (size_t frame = 0; frame < frames; ++frame) {
         // The fade level for this frame; 1.0 when there is no fade.
@@ -69,7 +106,10 @@ void ConvertFrames(const unsigned char* in, unsigned char* out, size_t frames,
             int32_t sample = ReadSample(in, inBps);
             in += inBytes;
 
-            if (scale) {
+            if (requantize) {
+                const double gain = scale ? (gains ? gains[channel] : 1.0) * fade : 1.0;
+                WriteIntSample(out, Requantize((double)sample * gain, step, dither), format);
+            } else if (scale) {
                 const double gain = (gains ? gains[channel] : 1.0) * fade;
                 double scaled = (double)sample * gain;
                 if (format.isFloat) {

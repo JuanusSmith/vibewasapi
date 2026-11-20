@@ -48,9 +48,10 @@ Settings LoadSettings(const std::wstring& iniPath) {
 void SaveSettings(const std::wstring& iniPath, const Settings& settings) {
     if (iniPath.empty()) return;
     WritePrivateProfileStringW(kIniSection, L"device", settings.deviceId.c_str(), iniPath.c_str());
-    WriteInt(iniPath, L"exclusive", settings.exclusive);
-    WriteInt(iniPath, L"fallback", settings.fallback);
-    WriteInt(iniPath, L"volume", settings.volume);
+    // On/off options are stored as 1 or 0, as in earlier versions.
+    WriteInt(iniPath, L"exclusive", settings.exclusive ? 1 : 0);
+    WriteInt(iniPath, L"fallback", settings.fallback ? 1 : 0);
+    WriteInt(iniPath, L"volume", settings.volume ? 1 : 0);
     WriteInt(iniPath, L"buffer_ms", settings.ringMs);
     WriteInt(iniPath, L"period_ms", settings.periodMs);
 }
