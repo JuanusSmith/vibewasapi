@@ -45,6 +45,16 @@ public:
         return -1;
     }
 
+    // Ends a fade-out at once. Use it when the audio to fade has run out: the ramp
+    // only moves forward as audio passes through it, so without audio a fade-out
+    // would never finish, and pause or seek would wait for their time limit
+    // (about a quarter of a second) instead of a few milliseconds. The device is
+    // already being given silence at that point, so declaring the fade finished
+    // changes nothing the listener hears. Does nothing unless fading out.
+    void finishFadeOut() {
+        if (isFading() && target_ <= 0.f) setLevel(0.f);
+    }
+
     // Describes the gain for the next `frames` frames, then moves past them.
     GainRamp take(long long frames) {
         GainRamp ramp;

@@ -295,8 +295,9 @@ void Flush(int timeMs) {
     EnterCriticalSection(&g_lifecycleLock);
     if (g_streamOpen.load()) {
         g_ring.requestDiscard();
-        g_timeline.seek(timeMs);
-        g_engine.flush();
+        g_timeline.seek(timeMs);   // From here GetOutputTime reports exactly timeMs...
+        g_engine.flush();          // ...while the old audio fades out and is dropped.
+        g_timeline.finishSeek();   // The engine's played count now starts from the target.
     }
     LeaveCriticalSection(&g_lifecycleLock);
 }

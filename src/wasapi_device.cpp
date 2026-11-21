@@ -352,6 +352,12 @@ HRESULT WasapiDevice::fill(UINT32 frames, SpscRing& ring, PositionTracker& track
         ConvertFrames(scratch_.data(), deviceBuffer, audioFrames, format_.bitsPerSample,
                       format_.channels, outFormat_, gains, fading ? &ramp : NULL, &dither_);
     }
+    // A fade-out that got less audio than it asked for has run out of old audio: the
+    // queue is empty, or reading stopped at a seek's discard marker. The rest of this
+    // buffer is silence (below), so the sound is already silent; say so, so a pause or
+    // seek can go ahead now rather than waiting for its time limit.
+    if (audibleLeft > 0 && audioFrames < wantedFrames) fader.finishFadeOut();
+
     if (audioFrames < frames) {
         memset(deviceBuffer + audioFrames * outFrameBytes, 0, (frames - audioFrames) * outFrameBytes);
     }

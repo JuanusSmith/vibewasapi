@@ -6,6 +6,13 @@
 //   * Seeks. After a seek to 1:30, frame counting restarts at zero, and every time
 //     reported adds 1:30 (the "seek base").
 //
+//     A seek takes a few milliseconds to carry out, because the render thread first
+//     fades the old audio out. Until it is done, the engine's played-frame count still
+//     belongs to the audio *before* the seek. Adding that old count to the new seek
+//     base would briefly show a time far past the target (seeking to 1:30 after
+//     14 seconds of playback would flash 1:44). So between seek() and finishSeek(),
+//     the reported time is simply the seek target.
+//
 //   * Gapless track changes. The device stream keeps running from one track into the
 //     next, so the render engine's frame counts belong to the *stream*, not to a track.
 //     When a track begins on a running stream, the timeline remembers the stream frame
@@ -35,11 +42,18 @@ public:
     void startGaplessTrack() { resetTrack(streamFramesWritten_.load(), 0); }
 
     // A seek to `timeMs`. The ring and the engine's counts restart from zero, so this
-    // does too.
+    // does too. Call finishSeek() once the engine has carried the seek out.
     void seek(int timeMs) {
+        // Raise the flag before changing the seek base, so a GetOutputTime call made
+        // in between never pairs the new base with the old played-frame count.
+        seekPending_.store(true);
         streamFramesWritten_.store(0);
         resetTrack(0, timeMs);
     }
+
+    // The engine has carried out the seek and its played-frame count has restarted
+    // from zero, so outputTimeMs() can go back to counting from the seek base.
+    void finishSeek() { seekPending_.store(false); }
 
     // Records `frames` of new audio written by the decoder.
     void onWritten(long long frames) {
@@ -55,6 +69,10 @@ public:
 
     // The song time being heard now, given the engine's count of stream frames played.
     int outputTimeMs(long long streamFramesPlayed) const {
+        // Mid-seek, the played count is left over from before the seek (see the top
+        // of this file), so report the target the listener is about to hear instead.
+        if (seekPending_.load()) return seekBaseMs_.load();
+
         long long trackFrames = streamFramesPlayed - trackStartFrame_.load();
         if (trackFrames < 0) trackFrames = 0;  // Still hearing the previous track
         return seekBaseMs_.load() + toMs(trackFrames);
@@ -79,4 +97,5 @@ private:
     std::atomic<long long> trackFramesWritten_{0};   // Since this track began or was seeked
     std::atomic<int> seekBaseMs_{0};                 // Song time of the most recent seek
     std::atomic<bool> endReported_{false};
+    std::atomic<bool> seekPending_{false};           // Between seek() and finishSeek()
 };

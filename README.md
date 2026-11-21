@@ -59,7 +59,7 @@ Winamp's threads and the audio thread are kept apart, so a slow device can't fre
 3. One MTA render thread makes every playback call to WASAPI. It wakes on the device's event, converts audio from the ring buffer into the device format, and fills any gap with silence.
 4. A device monitor receives Windows notifications when devices appear, disappear, or become the default. The render thread reconnects accordingly.
 5. The plug-in records how much silence went out before real audio. That lets it turn the device clock position into song time exactly, so `GetOutputTime` and `IsPlaying` (used for end-of-track drain) stay correct even after underruns.
-6. Pause, seek and stop first fade the sound to silence and wait until the faded audio has played. Only then is the device stopped and cleared, and playback fades back in if it continues.
+6. Pause, seek and stop first fade the sound to silence and wait until the faded audio has played. If the queued audio runs out mid-fade, the sound is already silent, so there is nothing to wait for. Only then is the device stopped and cleared, and playback fades back in if it continues. While a seek is being carried out, the time display shows the seek target.
 7. For gapless playback, `IsPlaying` reports the end of a track while about 500 ms of audio is still queued, so Winamp starts the next track early. The stream keeps playing that audio after `Close`. If the next `Open` has the same format and settings, the new track's audio follows straight on. Otherwise the old track finishes first and a fresh stream starts.
 
 ### Source files

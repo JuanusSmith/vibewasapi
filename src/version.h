@@ -9,6 +9,6 @@
 #pragma once
 
 #define VIBE_VERSION_MAJOR 0
-#define VIBE_VERSION_MINOR 7
-#define VIBE_VERSION_TEXT "0.7"
-#define VIBE_VERSION_FILE_TEXT "0.7.0.0"
+#define VIBE_VERSION_MINOR 8
+#define VIBE_VERSION_TEXT "0.8"
+#define VIBE_VERSION_FILE_TEXT "0.8.0.0"

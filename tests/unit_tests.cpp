@@ -428,10 +428,27 @@ static void TestTimelineSeekAddsTheTarget() {
     timeline.startStream(44100);
     timeline.onWritten(441000);
     timeline.seek(90000);                          // Seek to 1:30
+    timeline.finishSeek();                         // The engine has carried it out
     CHECK(timeline.outputTimeMs(0) == 90000);
     timeline.onWritten(44100);
     CHECK(timeline.writtenTimeMs() == 91000);
     CHECK(timeline.outputTimeMs(22050) == 90500);
+}
+
+// While a seek is being carried out, the engine's played count still belongs to the
+// audio before the seek. The time shown must be the target, not target + old count.
+static void TestTimelineShowsTargetDuringSeek() {
+    TrackTimeline timeline;
+    timeline.startStream(44100);
+    timeline.onWritten(44100 * 20);
+    const long long playedBeforeSeek = 44100 * 14;   // 14 seconds heard so far
+
+    timeline.seek(90000);                            // Seek to 1:30 begins
+    CHECK(timeline.outputTimeMs(playedBeforeSeek) == 90000);  // Not 1:44
+
+    timeline.finishSeek();                           // Engine's count restarts at zero
+    CHECK(timeline.outputTimeMs(0) == 90000);
+    CHECK(timeline.outputTimeMs(44100) == 91000);    // And counts up from the target
 }
 
 static void TestTimelineEndReportClearsOnNewAudio() {
@@ -494,6 +511,34 @@ static void TestFaderReversesMidFade() {
     CHECK(Near(ramp.start, 0.5));
     CHECK(Near(ramp.step, 0.01));
     CHECK(fader.isUnity());
+}
+
+// A fade-out whose audio runs out must count as finished, or pause and seek would
+// wait for their time limit.
+static void TestFaderFinishesFadeOutWhenAudioRunsOut() {
+    Fader fader;
+    fader.fadeTo(0.f, 100);
+    fader.take(30);                // Only 30 frames of old audio were left
+    CHECK(!fader.isSilent());
+    fader.finishFadeOut();
+    CHECK(fader.isSilent());
+    CHECK(fader.audibleFramesLeft() == 0);
+}
+
+// finishFadeOut must leave normal playback and fade-ins alone.
+static void TestFinishFadeOutIgnoresOtherStates() {
+    Fader steady;
+    steady.finishFadeOut();
+    CHECK(steady.isUnity());       // Full level stays full (and bit-perfect)
+
+    Fader fadingIn;
+    fadingIn.setLevel(0.f);
+    fadingIn.fadeTo(1.f, 100);
+    fadingIn.take(50);
+    fadingIn.finishFadeOut();
+    CHECK(fadingIn.isFading());    // Still rising towards full level
+    fadingIn.take(50);
+    CHECK(fadingIn.isUnity());
 }
 
 // --- Song position ----------------------------------------------------------
@@ -619,6 +664,8 @@ int main() {
     TestFaderFadesOutAndLimitsAudio();
     TestFaderFadesInToUnity();
     TestFaderReversesMidFade();
+    TestFaderFinishesFadeOutWhenAudioRunsOut();
+    TestFinishFadeOutIgnoresOtherStates();
 
     TestPositionIgnoresLeadingSilence();
     TestPositionStopsAtEndOfAudio();
@@ -627,6 +674,7 @@ int main() {
     TestTimelineCountsAFreshTrack();
     TestTimelineGaplessTrackStartsAtZero();
     TestTimelineSeekAddsTheTarget();
+    TestTimelineShowsTargetDuringSeek();
     TestTimelineEndReportClearsOnNewAudio();
 
     TestPauseKeepsNewestRequest();
